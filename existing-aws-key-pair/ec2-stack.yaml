@@ -1,7 +1,6 @@
-Description:  EC2 stack. This template deploys a VPC, with a pair of public and private subnets spread
-  across two Availability Zones. It deploys an internet gateway, with a default
-  route on the public subnets. It deploys a pair of NAT gateways (one in each AZ),
-  and default routes for them in the private subnets. It deploys an EC2 instance that is publicly exposed and all traffic is routed using an Application Load Balancer
+Description:  Deploys a highly available VPC with public and private subnets across two AZs,
+  internet and NAT gateways, an EC2 instance with EFS storage, and an
+  Application Load Balancer fronted by AWS WAF.
 
 Parameters:
   EnvironmentName:
@@ -276,6 +275,23 @@ Resources:
         - Key: Name
           Value: !Sub "${EnvironmentName} EC2 SecurityGroup"
 
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow NFS from EC2 instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName} EFS SecurityGroup"
+
 ########
 # IAM
 ########
@@ -291,6 +307,8 @@ Resources:
             Action: "sts:AssumeRole"
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonElasticFileSystemsUtils
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemClientReadWriteAccess
       Tags:
         - Key: Name
           Value: !Sub "${EnvironmentName} EC2 InstanceRole"
@@ -310,19 +328,30 @@ Resources:
     Properties:
       Encrypted: true
 
-  EFSMountTarget:
+  EFSMountTargetAz1:
     Type: AWS::EFS::MountTarget
     Properties:
       FileSystemId: !Ref EFS
       SubnetId: !Ref PrivateSubnet1
       SecurityGroups:
-        - !Ref EC2SecurityGroup
+        - !Ref EFSSecurityGroup
+
+  EFSMountTargetAz2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFS
+      SubnetId: !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
 
 ########
 # EC2
 ########
   PublicInstance:
     Type: AWS::EC2::Instance
+    DependsOn:
+      - EFSMountTargetAz1
+      - EFSMountTargetAz2
     Properties:
       InstanceType: t3.small
       SubnetId: !Ref PublicSubnet1
@@ -337,34 +366,62 @@ Resources:
             VolumeSize: 40
             VolumeType: gp2
       UserData:
-        Fn::Base64: |
+        Fn::Base64: !Sub |
           #!/bin/bash -xe
-          # Amazon Linux 2023
+
+          # --- Log everything to /var/log/user-data.log and console ---
+          exec > >(tee -a /var/log/user-data.log) 2>&1
+
+          # --- Install dependencies ---
           dnf -y update
-          dnf -y swap curl-minimal curl   # NOTE: AL2023 already has curl-minimal, replace with full curl
-          dnf -y install nginx tar
+          dnf -y install nginx tar amazon-efs-utils
           systemctl enable --now nginx
 
-          # Web root
+          # --- EFS mount ---
+          FILE_SYSTEM_ID=${EFS}
+          mkdir -p /mnt/efs
+
+          # --- Mount with TLS; will no-op if already mounted ---
+          if ! mountpoint -q /mnt/efs; then
+            mount -t efs -o tls $FILE_SYSTEM_ID:/ /mnt/efs
+          fi
+          # --- Persist EFS mount across reboots ---
+          if ! grep -q "^$FILE_SYSTEM_ID:/" /etc/fstab; then
+            echo "$FILE_SYSTEM_ID:/ /mnt/efs efs _netdev,tls 0 0" >> /etc/fstab
+          fi
+
+          mkdir -p /mnt/efs/html
+
+          # --- Web root ----
           WEBROOT=/usr/share/nginx/html
           mkdir -p "$WEBROOT"
 
-          # Fetch 2048 source to a temp dir
+          # --- Fetch 2048 source to a temp dir ---
           TMPDIR=$(mktemp -d)
           cd "$TMPDIR"
-          # curl is provided by curl-minimal on AL2023
           curl -L -o 2048.tar.gz https://github.com/gabrielecirulli/2048/archive/refs/heads/master.tar.gz
           tar -xzf 2048.tar.gz
 
-          # The archive extracts to a single top-level folder; detect it:
+          # --- The archive extracts to a single top-level folder; detect it: ---
           SRC_DIR=$(tar -tzf 2048.tar.gz | head -1 | cut -f1 -d"/")
           [ -d "$SRC_DIR" ] || SRC_DIR="."
 
-          # Clean the default placeholder index so it cannot shadow the game
-          sudo rm -f "$WEBROOT/index.html"
+          # --- Clean the default placeholder index so it cannot shadow the game ---
+          rm -f "$WEBROOT/index.html"
 
-          # Copy game files into the web root (overwrite if re-run)
-          sudo rsync -a --delete "$SRC_DIR"/ "$WEBROOT"/ || cp -a "$SRC_DIR"/. "$WEBROOT"/
+          # --- Seed EFS (first boot) and copy game files into efs location ---
+          if [ ! -f /mnt/efs/html/index.html ]; then
+            rsync -a --delete "$SRC_DIR"/ /mnt/efs/html/ || cp -a "$SRC_DIR"/. /mnt/efs/html/
+          fi
+
+          # --- Bind-mount EFS content over the NGINX web root (keeps your nginx.conf unchanged) ---
+          if ! mountpoint -q "$WEBROOT"; then
+            mount --bind /mnt/efs/html "$WEBROOT"
+          fi
+          # --- Persist bind mount ---
+          if ! grep -q "/mnt/efs/html $WEBROOT none bind" /etc/fstab; then
+            echo "/mnt/efs/html $WEBROOT none bind 0 0" >> /etc/fstab
+          fi
 
           # Minimal nginx.conf (static site). Comment this block if you prefer distro defaults.
           cat >/etc/nginx/nginx.conf <<'NGINXCONF'
@@ -394,10 +451,10 @@ Resources:
             }
           }
           NGINXCONF
-
+          
           # Test & reload NGINX
-          sudo nginx -t
-          sudo systemctl reload nginx
+          nginx -t
+          systemctl reload nginx
 
           # Cleanup
           rm -rf "$TMPDIR"
@@ -426,7 +483,7 @@ Resources:
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: pda-alb
+      Name: !Sub "${EnvironmentName}-alb"
       Scheme: internet-facing
       LoadBalancerAttributes:
         - Key: idle_timeout.timeout_seconds
@@ -467,6 +524,42 @@ Resources:
   #     DefaultActions:
   #       - Type: forward
   #         TargetGroupArn: !Ref TargetGroup
+
+########
+# WAF
+########
+  WAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${EnvironmentName}-web-acl"
+      Scope: "REGIONAL"
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${EnvironmentName}-web-acl-metrics"
+      Rules:
+        - Name: RuleWithAWSManagedRules
+          Priority: 0
+          OverrideAction:
+            Count: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: DemoEC2RuleWithAWSManagedRulesMetric
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules: []
+
+# Associate WAF WebACL with ALB
+  WAFWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref ApplicationLoadBalancer
+      WebACLArn: !GetAtt WAFWebACL.Arn
 
 Outputs:
   VPC:
@@ -509,10 +602,6 @@ Outputs:
     Description: A reference to the private route table in the 2nd Availability Zone
     Value: !Ref PrivateRouteTable2
 
-  NoIngressSecurityGroup:
-    Description: Security group with no ingress rule
-    Value: !Ref NoIngressSecurityGroup
-
   LoadBalancerDNSName:
     Description: The DNS name for the load balancer
     Value: !GetAtt ApplicationLoadBalancer.DNSName
@@ -523,4 +612,4 @@ Outputs:
 
   LoadBalancerSecurityGroups:
     Description: The IDs of the security groups for the load balancer
-    Value: !GetAtt ApplicationLoadBalancer.SecurityGroups
+    Value: !Join [",", !GetAtt ApplicationLoadBalancer.SecurityGroups]
